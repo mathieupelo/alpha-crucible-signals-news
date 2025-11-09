@@ -12,7 +12,7 @@ import psycopg2
 from psycopg2.extras import execute_values, Json
 from psycopg2 import sql
 from datetime import datetime, date, timedelta
-from typing import List, Dict, Optional, Any, Tuple
+from typing import List, Dict, Optional, Any, Tuple, Set
 from pathlib import Path
 from dotenv import load_dotenv
 import warnings
@@ -473,6 +473,19 @@ def is_signal_processed(main_conn, ticker: str, target_date: date, signal_name: 
         return False
 
 
+def get_all_tickers(main_conn) -> Set[str]:
+    """Get all distinct tickers from universe_tickers table."""
+    try:
+        with main_conn.cursor() as cursor:
+            cursor.execute("SELECT DISTINCT ticker FROM universe_tickers ORDER BY ticker;")
+            tickers = {row[0] for row in cursor.fetchall()}
+            logger.debug(f"Found {len(tickers)} distinct tickers in database")
+            return tickers
+    except Exception as e:
+        logger.error(f"Error fetching distinct tickers: {e}")
+        raise
+
+
 def get_sentiment_for_date_range(ore_conn, ticker: str, end_date: date, days: int = 7) -> List[Dict[str, Any]]:
     """Get sentiment scores for a ticker over the last N days."""
     try:
@@ -581,8 +594,8 @@ def calculate_aggregated_sentiment(sentiment_list: List[Dict[str, Any]], target_
     }
 
 
-def insert_signal(main_conn, ticker: str, target_date: date, signal_name: str, value: float, metadata: Dict[str, Any]):
-    """Insert or update signal in signal_raw table."""
+def insert_signal(main_conn, ticker: str, target_date: date, signal_name: str, value: Optional[float], metadata: Optional[Dict[str, Any]]):
+    """Insert or update signal in signal_raw table. Value can be None if no sentiment data available."""
     try:
         with main_conn.cursor() as cursor:
             # Check if signal_id column exists
@@ -593,6 +606,9 @@ def insert_signal(main_conn, ticker: str, target_date: date, signal_name: str, v
                 )
             """)
             has_signal_id = cursor.fetchone()[0]
+            
+            # Prepare metadata (can be None)
+            metadata_json = Json(metadata) if metadata else None
             
             if has_signal_id:
                 # Get or create signal_id
@@ -614,8 +630,8 @@ def insert_signal(main_conn, ticker: str, target_date: date, signal_name: str, v
                         ticker,
                         signal_name,
                         signal_id,
-                        value,
-                        Json(metadata)
+                        value,  # Can be None
+                        metadata_json
                     ))
                 else:
                     # Fallback: try without signal_id (might fail if NOT NULL)
@@ -632,8 +648,8 @@ def insert_signal(main_conn, ticker: str, target_date: date, signal_name: str, v
                         target_date,
                         ticker,
                         signal_name,
-                        value,
-                        Json(metadata)
+                        value,  # Can be None
+                        metadata_json
                     ))
             else:
                 # Use signal_name only (old schema)
@@ -650,8 +666,8 @@ def insert_signal(main_conn, ticker: str, target_date: date, signal_name: str, v
                     target_date,
                     ticker,
                     signal_name,
-                    value,
-                    Json(metadata)
+                    value,  # Can be None
+                    metadata_json
                 ))
             
             main_conn.commit()
@@ -660,6 +676,38 @@ def insert_signal(main_conn, ticker: str, target_date: date, signal_name: str, v
         logger.error(f"Error inserting signal for {ticker}/{target_date}: {e}")
         main_conn.rollback()
         raise
+
+
+def ensure_value_column_nullable(main_conn):
+    """Ensure the value column in signal_raw allows NULL values."""
+    try:
+        with main_conn.cursor() as cursor:
+            # Check if value column is nullable
+            cursor.execute("""
+                SELECT is_nullable 
+                FROM information_schema.columns 
+                WHERE table_name = 'signal_raw' 
+                AND column_name = 'value';
+            """)
+            result = cursor.fetchone()
+            
+            if result and result[0] == 'NO':
+                # Column is NOT NULL, alter it to allow NULL
+                logger.info("Altering signal_raw.value column to allow NULL values...")
+                cursor.execute("""
+                    ALTER TABLE signal_raw 
+                    ALTER COLUMN value DROP NOT NULL;
+                """)
+                main_conn.commit()
+                logger.info("✓ signal_raw.value column now allows NULL values")
+            elif result and result[0] == 'YES':
+                logger.debug("signal_raw.value column already allows NULL values")
+            else:
+                logger.warning("Could not determine nullability of signal_raw.value column")
+                
+    except Exception as e:
+        logger.warning(f"Could not alter signal_raw.value column: {e}. Will attempt insert anyway.")
+        main_conn.rollback()
 
 
 def process_date_range(start_date: date, end_date: date, ore_conn, main_conn, analyzer: FinBERTSentimentAnalyzer):
@@ -678,8 +726,33 @@ def process_date_range(start_date: date, end_date: date, ore_conn, main_conn, an
             # Step 1: Get all news for this date
             news_list = get_news_for_date(ore_conn, current_date)
             
+            # Get all tickers from main database (needed for NULL signal insertion)
+            all_tickers = get_all_tickers(main_conn)
+            
             if not news_list:
-                logger.info(f"No news found for {current_date}. Moving to next date.")
+                logger.info(f"No news found for {current_date}. Inserting NULL signals for all tickers.")
+                # Insert NULL signals for all tickers when no news
+                for ticker in all_tickers:
+                    try:
+                        # Check if signal already processed
+                        if is_signal_processed(main_conn, ticker, current_date, 'SENTIMENT_YFINANCE_NEWS'):
+                            continue
+                        
+                        # Insert NULL signal
+                        insert_signal(
+                            main_conn,
+                            ticker,
+                            current_date,
+                            'SENTIMENT_YFINANCE_NEWS',
+                            None,  # NULL value
+                            {'reason': 'no_news_data_for_date', 'date': str(current_date)}
+                        )
+                        total_signals_processed += 1
+                    except Exception as e:
+                        total_errors += 1
+                        logger.error(f"ERROR: Failed to insert NULL signal for {ticker} on {current_date}: {e}", exc_info=True)
+                        continue
+                
                 current_date += timedelta(days=1)
                 continue
             
@@ -726,24 +799,34 @@ def process_date_range(start_date: date, end_date: date, ore_conn, main_conn, an
                     sentiment_list = get_sentiment_for_date_range(ore_conn, ticker, current_date, days=7)
                     
                     if not sentiment_list:
-                        logger.info(f"No sentiment data available for {ticker} on {current_date}")
-                        continue
-                    
-                    # Calculate aggregated sentiment
-                    aggregated = calculate_aggregated_sentiment(sentiment_list, current_date)
-                    
-                    # Insert signal
-                    insert_signal(
-                        main_conn,
-                        ticker,
-                        current_date,
-                        'SENTIMENT_YFINANCE_NEWS',
-                        aggregated['aggregated_score'],
-                        aggregated['metadata']
-                    )
-                    
-                    total_signals_processed += 1
-                    logger.info(f"✓ Processed aggregated sentiment signal for {ticker} on {current_date}: {aggregated['aggregated_score']:.3f} (from {aggregated['count']} news articles)")
+                        # No sentiment data available - insert NULL signal
+                        logger.info(f"No sentiment data available for {ticker} on {current_date}, inserting NULL signal")
+                        insert_signal(
+                            main_conn,
+                            ticker,
+                            current_date,
+                            'SENTIMENT_YFINANCE_NEWS',
+                            None,  # NULL value
+                            {'reason': 'no_sentiment_data_available', 'date': str(current_date)}
+                        )
+                        total_signals_processed += 1
+                        logger.info(f"✓ Inserted NULL signal for {ticker} on {current_date} (no sentiment data)")
+                    else:
+                        # Calculate aggregated sentiment
+                        aggregated = calculate_aggregated_sentiment(sentiment_list, current_date)
+                        
+                        # Insert signal
+                        insert_signal(
+                            main_conn,
+                            ticker,
+                            current_date,
+                            'SENTIMENT_YFINANCE_NEWS',
+                            aggregated['aggregated_score'],
+                            aggregated['metadata']
+                        )
+                        
+                        total_signals_processed += 1
+                        logger.info(f"✓ Processed aggregated sentiment signal for {ticker} on {current_date}: {aggregated['aggregated_score']:.3f} (from {aggregated['count']} news articles)")
                     
                 except Exception as e:
                     total_errors += 1
@@ -811,6 +894,10 @@ def main():
         # Create sentiment table if needed
         logger.info("Creating/verifying sentiment table structure...")
         create_sentiment_table(ore_conn)
+        
+        # Ensure signal_raw.value column allows NULL
+        logger.info("Ensuring signal_raw.value column allows NULL values...")
+        ensure_value_column_nullable(main_conn)
         
         # Initialize FinBERT analyzer
         logger.info("Initializing FinBERT sentiment analyzer...")
