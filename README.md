@@ -34,6 +34,34 @@ See `.env.example` for required environment variables.
 - `0`: Success
 - `1`: Failure
 
+## Testing
+
+Run all tests:
+```bash
+python run_tests.py
+```
+
+Run individual test files:
+```bash
+python test_decay.py          # Tests decay calculation logic (no database)
+python test_integration.py    # Tests database integration and cleanup
+```
+
+### Test Cleanup
+
+All tests that insert data into the database automatically clean up after themselves using the `TestDataCleanup` class in `test_cleanup.py`. This ensures:
+
+- No test data remains in the database after tests complete
+- Tests can be run multiple times without conflicts
+- Database state is preserved
+
+The cleanup system tracks:
+- Signals inserted into `signal_raw`
+- Sentiments inserted into `copper.yfinance_news_sentiment`
+- Signal records created in `signal` table (if applicable)
+
+Cleanup happens automatically in `finally` blocks, even if tests fail.
+
 ## Development
 
 This is a skeleton repository. Implement your signal calculation logic in `main.py`.
