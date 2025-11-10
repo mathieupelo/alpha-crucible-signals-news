@@ -11,6 +11,7 @@ import json
 import psycopg2
 from psycopg2.extras import execute_values, Json
 from psycopg2 import sql
+from psycopg2 import errors as psycopg2_errors
 from datetime import datetime, date, timedelta
 from typing import List, Dict, Optional, Any, Tuple, Set
 from pathlib import Path
@@ -284,14 +285,86 @@ def create_sentiment_table(ore_conn):
         raise
 
 
-def get_news_for_date(ore_conn, target_date: date) -> List[Dict[str, Any]]:
-    """Get all news articles for a specific date from ORE database."""
+def get_unprocessed_news_in_range(ore_conn, end_date: date, days: int = 28) -> List[Dict[str, Any]]:
+    """Get all news articles from the last N days that haven't had sentiment calculated yet."""
+    try:
+        start_date = end_date - timedelta(days=days-1)
+        with ore_conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT n.id, n.ticker, n.title, n.summary, n.publisher, n.link, n.published_date, n.image_url
+                FROM copper.yfinance_news n
+                LEFT JOIN copper.yfinance_news_sentiment s ON n.id = s.yfinance_news_id
+                WHERE CAST(n.published_date AS DATE) >= %s
+                AND CAST(n.published_date AS DATE) <= %s
+                AND s.yfinance_news_id IS NULL
+                ORDER BY n.published_date DESC, n.ticker;
+            """, (start_date, end_date))
+            
+            rows = cursor.fetchall()
+            news_list = []
+            for row in rows:
+                news_list.append({
+                    'id': row[0],
+                    'ticker': row[1],
+                    'title': row[2] or '',
+                    'summary': row[3] or '',
+                    'publisher': row[4] or '',
+                    'link': row[5] or '',
+                    'published_date': row[6],
+                    'image_url': row[7] or ''
+                })
+            
+            logger.info(f"Found {len(news_list)} unprocessed news articles from {start_date} to {end_date}")
+            return news_list
+            
+    except Exception as e:
+        logger.error(f"Error fetching unprocessed news from {start_date} to {end_date}: {e}")
+        raise
+
+
+def get_news_for_ticker_and_date(ore_conn, ticker: str, target_date: date) -> List[Dict[str, Any]]:
+    """Get all news articles for a specific ticker and date from ORE database."""
     try:
         with ore_conn.cursor() as cursor:
             cursor.execute("""
                 SELECT id, ticker, title, summary, publisher, link, published_date, image_url
                 FROM copper.yfinance_news
-                WHERE DATE(published_date) = %s
+                WHERE ticker = %s
+                AND CAST(published_date AS DATE) = %s
+                ORDER BY published_date;
+            """, (ticker, target_date))
+            
+            rows = cursor.fetchall()
+            news_list = []
+            for row in rows:
+                news_list.append({
+                    'id': row[0],
+                    'ticker': row[1],
+                    'title': row[2] or '',
+                    'summary': row[3] or '',
+                    'publisher': row[4] or '',
+                    'link': row[5] or '',
+                    'published_date': row[6],
+                    'image_url': row[7] or ''
+                })
+            
+            return news_list
+            
+    except Exception as e:
+        logger.error(f"Error fetching news for {ticker} on {target_date}: {e}")
+        raise
+
+
+def get_news_for_date(ore_conn, target_date: date) -> List[Dict[str, Any]]:
+    """Get all news articles for a specific date from ORE database."""
+    try:
+        with ore_conn.cursor() as cursor:
+            # Use CAST to date for more reliable date comparison
+            # This handles timezone issues better than DATE() function
+            cursor.execute("""
+                SELECT id, ticker, title, summary, publisher, link, published_date, image_url
+                FROM copper.yfinance_news
+                WHERE CAST(published_date AS DATE) = %s
                 ORDER BY ticker, published_date;
             """, (target_date,))
             
@@ -310,6 +383,38 @@ def get_news_for_date(ore_conn, target_date: date) -> List[Dict[str, Any]]:
                 })
             
             logger.info(f"Found {len(news_list)} news articles for {target_date}")
+            
+            # If no news found, check if there's any news in the database and suggest recent dates
+            if len(news_list) == 0:
+                cursor.execute("""
+                    SELECT COUNT(*) as total, 
+                           MIN(CAST(published_date AS DATE)) as min_date,
+                           MAX(CAST(published_date AS DATE)) as max_date
+                    FROM copper.yfinance_news;
+                """)
+                stats = cursor.fetchone()
+                if stats and stats[0] > 0:
+                    logger.warning(
+                        f"No news found for {target_date}, but database contains {stats[0]} total articles "
+                        f"with date range {stats[1]} to {stats[2]}"
+                    )
+                    # Suggest recent dates with news
+                    cursor.execute("""
+                        SELECT CAST(published_date AS DATE) as pub_date, COUNT(*) as count
+                        FROM copper.yfinance_news
+                        WHERE CAST(published_date AS DATE) >= %s
+                        GROUP BY CAST(published_date AS DATE)
+                        ORDER BY pub_date DESC
+                        LIMIT 5
+                    """, (target_date - timedelta(days=7),))
+                    recent_dates = cursor.fetchall()
+                    if recent_dates:
+                        logger.info("Recent dates with news (consider processing these instead):")
+                        for pub_date, count in recent_dates:
+                            logger.info(f"  {pub_date}: {count} articles")
+                else:
+                    logger.warning(f"No news found for {target_date} and database appears empty")
+            
             return news_list
             
     except Exception as e:
@@ -423,10 +528,22 @@ def get_or_create_signal_id(main_conn, signal_name: str) -> int:
         return None
 
 
-def is_signal_processed(main_conn, ticker: str, target_date: date, signal_name: str) -> bool:
-    """Check if signal has already been calculated for a ticker/date."""
+def is_signal_processed(main_conn, ticker: str, target_date: date, signal_name: str, company_uid: Optional[str] = None) -> bool:
+    """
+    Check if signal has already been calculated for a company_uid/date or ticker/date.
+    Prioritizes company_uid check if available to avoid duplicate processing.
+    """
     try:
         with main_conn.cursor() as cursor:
+            # Check if company_uid column exists
+            cursor.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.columns 
+                    WHERE table_name = 'signal_raw' AND column_name = 'company_uid'
+                )
+            """)
+            has_company_uid = cursor.fetchone()[0]
+            
             # Check if signal_id column exists
             cursor.execute("""
                 SELECT EXISTS (
@@ -436,19 +553,59 @@ def is_signal_processed(main_conn, ticker: str, target_date: date, signal_name: 
             """)
             has_signal_id = cursor.fetchone()[0]
             
-            if has_signal_id:
-                # Use signal_id if available
-                signal_id = get_or_create_signal_id(main_conn, signal_name)
-                if signal_id:
+            # Resolve company_uid if not provided but column exists
+            if has_company_uid and not company_uid:
+                company_uid = resolve_ticker_to_company_uid(main_conn, ticker)
+            
+            # Use company_uid for checking if available (more efficient, avoids duplicates)
+            if has_company_uid and company_uid:
+                if has_signal_id:
+                    signal_id = get_or_create_signal_id(main_conn, signal_name)
+                    if signal_id:
+                        cursor.execute("""
+                            SELECT COUNT(*) 
+                            FROM signal_raw 
+                            WHERE company_uid = %s 
+                            AND asof_date = %s 
+                            AND signal_id = %s;
+                        """, (company_uid, target_date, signal_id))
+                    else:
+                        cursor.execute("""
+                            SELECT COUNT(*) 
+                            FROM signal_raw 
+                            WHERE company_uid = %s 
+                            AND asof_date = %s 
+                            AND signal_name = %s;
+                        """, (company_uid, target_date, signal_name))
+                else:
                     cursor.execute("""
                         SELECT COUNT(*) 
                         FROM signal_raw 
-                        WHERE ticker = %s 
+                        WHERE company_uid = %s 
                         AND asof_date = %s 
-                        AND signal_id = %s;
-                    """, (ticker, target_date, signal_id))
+                        AND signal_name = %s;
+                    """, (company_uid, target_date, signal_name))
+            else:
+                # Fallback to ticker-based check
+                if has_signal_id:
+                    signal_id = get_or_create_signal_id(main_conn, signal_name)
+                    if signal_id:
+                        cursor.execute("""
+                            SELECT COUNT(*) 
+                            FROM signal_raw 
+                            WHERE ticker = %s 
+                            AND asof_date = %s 
+                            AND signal_id = %s;
+                        """, (ticker, target_date, signal_id))
+                    else:
+                        cursor.execute("""
+                            SELECT COUNT(*) 
+                            FROM signal_raw 
+                            WHERE ticker = %s 
+                            AND asof_date = %s 
+                            AND signal_name = %s;
+                        """, (ticker, target_date, signal_name))
                 else:
-                    # Fallback to signal_name
                     cursor.execute("""
                         SELECT COUNT(*) 
                         FROM signal_raw 
@@ -456,15 +613,6 @@ def is_signal_processed(main_conn, ticker: str, target_date: date, signal_name: 
                         AND asof_date = %s 
                         AND signal_name = %s;
                     """, (ticker, target_date, signal_name))
-            else:
-                # Use signal_name only
-                cursor.execute("""
-                    SELECT COUNT(*) 
-                    FROM signal_raw 
-                    WHERE ticker = %s 
-                    AND asof_date = %s 
-                    AND signal_name = %s;
-                """, (ticker, target_date, signal_name))
             
             count = cursor.fetchone()[0]
             return count > 0
@@ -473,23 +621,109 @@ def is_signal_processed(main_conn, ticker: str, target_date: date, signal_name: 
         return False
 
 
-def get_all_tickers(main_conn) -> Set[str]:
-    """Get all distinct tickers from universe_tickers table."""
+def get_all_tickers_with_company_uid(main_conn) -> Dict[str, str]:
+    """
+    Get all tickers with their corresponding company_uid from varrock.tickers table.
+    
+    Returns:
+        Dictionary mapping ticker -> company_uid
+    """
     try:
         with main_conn.cursor() as cursor:
-            cursor.execute("SELECT DISTINCT ticker FROM universe_tickers ORDER BY ticker;")
-            tickers = {row[0] for row in cursor.fetchall()}
-            logger.debug(f"Found {len(tickers)} distinct tickers in database")
-            return tickers
+            # Query all tickers with company_uid from varrock.tickers table
+            # Filter by is_active = TRUE to only get active tickers
+            # Use yfinance_symbol if available, otherwise use ticker
+            cursor.execute("""
+                SELECT DISTINCT 
+                    COALESCE(t.yfinance_symbol, t.ticker) as ticker,
+                    t.company_uid
+                FROM varrock.tickers t
+                WHERE t.is_active = TRUE
+                ORDER BY ticker;
+            """)
+            ticker_map = {}
+            for row in cursor.fetchall():
+                ticker = row[0]
+                company_uid = row[1]
+                # If multiple tickers map to same company, keep the first one
+                if ticker not in ticker_map:
+                    ticker_map[ticker] = company_uid
+            
+            logger.info(f"Found {len(ticker_map)} distinct tickers with company_uid (from varrock.tickers)")
+            return ticker_map
     except Exception as e:
-        logger.error(f"Error fetching distinct tickers: {e}")
+        logger.error(f"Error fetching tickers with company_uid: {e}")
         raise
 
 
-def get_sentiment_for_date_range(ore_conn, ticker: str, end_date: date, days: int = 7) -> List[Dict[str, Any]]:
-    """Get sentiment scores for a ticker over the last N days."""
+def get_all_tickers(main_conn) -> Set[str]:
+    """Get all distinct tickers from varrock.tickers table (all tickers, even if not in universes)."""
+    ticker_map = get_all_tickers_with_company_uid(main_conn)
+    return set(ticker_map.keys())
+
+
+def resolve_ticker_to_company_uid(main_conn, ticker: str) -> Optional[str]:
+    """
+    Resolve a ticker symbol to company_uid via varrock.tickers.
+    
+    Args:
+        main_conn: Database connection
+        ticker: Ticker symbol to resolve (can be either ticker or yfinance_symbol)
+        
+    Returns:
+        company_uid if found, None if not found
+    """
+    try:
+        with main_conn.cursor() as cursor:
+            # Try to find company_uid by matching either ticker or yfinance_symbol
+            cursor.execute("""
+                SELECT company_uid 
+                FROM varrock.tickers 
+                WHERE ticker = %s OR yfinance_symbol = %s
+                LIMIT 1
+            """, (ticker.strip().upper(), ticker.strip().upper()))
+            
+            result = cursor.fetchone()
+            if result:
+                return str(result[0])
+            return None
+    except Exception as e:
+        logger.warning(f"Error resolving ticker {ticker} to company_uid: {e}")
+        return None
+
+
+def get_tickers_with_sentiment_in_range(ore_conn, end_date: date, days: int = 28) -> Set[str]:
+    """Get all distinct tickers that have sentiment data in the last N days."""
     try:
         start_date = end_date - timedelta(days=days-1)
+        
+        with ore_conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT DISTINCT s.ticker
+                FROM copper.yfinance_news_sentiment s
+                JOIN copper.yfinance_news n ON s.yfinance_news_id = n.id
+                WHERE DATE(n.published_date) >= %s
+                AND DATE(n.published_date) <= %s
+                ORDER BY s.ticker;
+            """, (start_date, end_date))
+            
+            tickers = {row[0] for row in cursor.fetchall()}
+            logger.debug(f"Found {len(tickers)} tickers with sentiment data from {start_date} to {end_date}")
+            return tickers
+    except Exception as e:
+        logger.error(f"Error fetching tickers with sentiment in range: {e}")
+        return set()
+
+
+def get_sentiment_for_date_range(ore_conn, ticker: str, end_date: date, days: int = 28) -> List[Dict[str, Any]]:
+    """
+    Get sentiment scores for a ticker over the last N days up to and including the end_date.
+    So if end_date is 2025-11-09 and days=28, it gets sentiment from 2025-10-13 to 2025-11-09 (inclusive).
+    """
+    try:
+        # Calculate start_date: end_date - (days-1) to get exactly 'days' days including end_date
+        start_date = end_date - timedelta(days=days-1)
+        # Include end_date (current date)
         
         with ore_conn.cursor() as cursor:
             cursor.execute("""
@@ -503,8 +737,8 @@ def get_sentiment_for_date_range(ore_conn, ticker: str, end_date: date, days: in
                 FROM copper.yfinance_news_sentiment s
                 JOIN copper.yfinance_news n ON s.yfinance_news_id = n.id
                 WHERE s.ticker = %s
-                AND DATE(n.published_date) >= %s
-                AND DATE(n.published_date) <= %s
+                AND CAST(n.published_date AS DATE) >= %s
+                AND CAST(n.published_date AS DATE) <= %s
                 ORDER BY n.published_date DESC;
             """, (ticker, start_date, end_date))
             
@@ -527,11 +761,12 @@ def get_sentiment_for_date_range(ore_conn, ticker: str, end_date: date, days: in
         return []
 
 
-def calculate_aggregated_sentiment(sentiment_list: List[Dict[str, Any]], target_date: date) -> Dict[str, Any]:
+def calculate_aggregated_sentiment(sentiment_list: List[Dict[str, Any]], target_date: date, window_days: int = 28) -> Dict[str, Any]:
     """
-    Calculate aggregated sentiment with 7-day decay weighting.
+    Calculate aggregated sentiment with decay weighting over a specified window.
     
     Decay: Day 0 (most recent) = 1.0, Day 1 = 0.5, Day 2 = 0.25, etc.
+    Window: Default 28 days (news older than window_days is excluded).
     """
     if not sentiment_list:
         return {
@@ -554,8 +789,8 @@ def calculate_aggregated_sentiment(sentiment_list: List[Dict[str, Any]], target_
         # Calculate days ago from target_date
         days_ago = (target_date - pub_date).days
         
-        if days_ago < 0 or days_ago >= 7:
-            continue  # Skip if outside 7-day window
+        if days_ago < 0 or days_ago >= window_days:
+            continue  # Skip if outside window
         
         # Calculate decay weight: 0.5^days_ago
         weight = 0.5 ** days_ago
@@ -583,8 +818,9 @@ def calculate_aggregated_sentiment(sentiment_list: List[Dict[str, Any]], target_
         'weighted_news_count': total_news_in_window,
         'total_weight': total_weight,
         'sentiment_by_day': sentiment_by_day,
-        'calculation_method': '7_day_decay_weighted_average',
-        'decay_factor': 0.5
+        'calculation_method': f'{window_days}_day_decay_weighted_average',
+        'decay_factor': 0.5,
+        'window_days': window_days
     }
     
     return {
@@ -607,6 +843,22 @@ def insert_signal(main_conn, ticker: str, target_date: date, signal_name: str, v
             """)
             has_signal_id = cursor.fetchone()[0]
             
+            # Check if company_uid column exists
+            cursor.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.columns 
+                    WHERE table_name = 'signal_raw' AND column_name = 'company_uid'
+                )
+            """)
+            has_company_uid = cursor.fetchone()[0]
+            
+            # Resolve ticker to company_uid if column exists
+            company_uid = None
+            if has_company_uid:
+                company_uid = resolve_ticker_to_company_uid(main_conn, ticker)
+                if not company_uid:
+                    logger.warning(f"Could not resolve ticker {ticker} to company_uid, inserting with NULL company_uid")
+            
             # Prepare metadata (can be None)
             metadata_json = Json(metadata) if metadata else None
             
@@ -614,14 +866,140 @@ def insert_signal(main_conn, ticker: str, target_date: date, signal_name: str, v
                 # Get or create signal_id
                 signal_id = get_or_create_signal_id(main_conn, signal_name)
                 if signal_id:
-                    # Use signal_id in insert
+                    if has_company_uid and company_uid:
+                        # Use signal_id and company_uid in insert - prioritize company_uid for conflict resolution
+                        # Try to use company_uid-based conflict first if unique constraint exists
+                        try:
+                            cursor.execute("""
+                                INSERT INTO signal_raw 
+                                (asof_date, ticker, signal_name, signal_id, company_uid, value, metadata)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                                ON CONFLICT (asof_date, ticker, signal_id) 
+                                DO UPDATE SET
+                                    company_uid = EXCLUDED.company_uid,
+                                    value = EXCLUDED.value,
+                                    metadata = EXCLUDED.metadata,
+                                    created_at = CURRENT_TIMESTAMP;
+                            """, (
+                                target_date,
+                                ticker,
+                                signal_name,
+                                signal_id,
+                                company_uid,
+                                value,  # Can be None
+                                metadata_json
+                            ))
+                        except psycopg2_errors.UniqueViolation:
+                            # If company_uid-based conflict, try alternative conflict resolution
+                            cursor.execute("""
+                                INSERT INTO signal_raw 
+                                (asof_date, ticker, signal_name, signal_id, company_uid, value, metadata)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                                ON CONFLICT (asof_date, ticker, signal_name) 
+                                DO UPDATE SET
+                                    signal_id = EXCLUDED.signal_id,
+                                    company_uid = EXCLUDED.company_uid,
+                                    value = EXCLUDED.value,
+                                    metadata = EXCLUDED.metadata,
+                                    created_at = CURRENT_TIMESTAMP;
+                            """, (
+                                target_date,
+                                ticker,
+                                signal_name,
+                                signal_id,
+                                company_uid,
+                                value,  # Can be None
+                                metadata_json
+                            ))
+                    elif has_company_uid:
+                        # company_uid column exists but couldn't resolve - use ticker-based conflict
+                        cursor.execute("""
+                            INSERT INTO signal_raw 
+                            (asof_date, ticker, signal_name, signal_id, company_uid, value, metadata)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (asof_date, ticker, signal_id) 
+                            DO UPDATE SET
+                                company_uid = EXCLUDED.company_uid,
+                                value = EXCLUDED.value,
+                                metadata = EXCLUDED.metadata,
+                                created_at = CURRENT_TIMESTAMP;
+                        """, (
+                            target_date,
+                            ticker,
+                            signal_name,
+                            signal_id,
+                            company_uid,  # NULL
+                            value,  # Can be None
+                            metadata_json
+                        ))
+                    else:
+                        # Use signal_id without company_uid
+                        cursor.execute("""
+                            INSERT INTO signal_raw 
+                            (asof_date, ticker, signal_name, signal_id, value, metadata)
+                            VALUES (%s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (asof_date, ticker, signal_name) 
+                            DO UPDATE SET
+                                signal_id = EXCLUDED.signal_id,
+                                value = EXCLUDED.value,
+                                metadata = EXCLUDED.metadata,
+                                created_at = CURRENT_TIMESTAMP;
+                        """, (
+                            target_date,
+                            ticker,
+                            signal_name,
+                            signal_id,
+                            value,  # Can be None
+                            metadata_json
+                        ))
+                else:
+                    # Fallback: try without signal_id
+                    if has_company_uid:
+                        cursor.execute("""
+                            INSERT INTO signal_raw 
+                            (asof_date, ticker, signal_name, company_uid, value, metadata)
+                            VALUES (%s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (asof_date, ticker, signal_name) 
+                            DO UPDATE SET
+                                company_uid = EXCLUDED.company_uid,
+                                value = EXCLUDED.value,
+                                metadata = EXCLUDED.metadata,
+                                created_at = CURRENT_TIMESTAMP;
+                        """, (
+                            target_date,
+                            ticker,
+                            signal_name,
+                            company_uid,  # Can be None
+                            value,  # Can be None
+                            metadata_json
+                        ))
+                    else:
+                        cursor.execute("""
+                            INSERT INTO signal_raw 
+                            (asof_date, ticker, signal_name, value, metadata)
+                            VALUES (%s, %s, %s, %s, %s)
+                            ON CONFLICT (asof_date, ticker, signal_name) 
+                            DO UPDATE SET
+                                value = EXCLUDED.value,
+                                metadata = EXCLUDED.metadata,
+                                created_at = CURRENT_TIMESTAMP;
+                        """, (
+                            target_date,
+                            ticker,
+                            signal_name,
+                            value,  # Can be None
+                            metadata_json
+                        ))
+            else:
+                # Use signal_name only (old schema)
+                if has_company_uid:
                     cursor.execute("""
                         INSERT INTO signal_raw 
-                        (asof_date, ticker, signal_name, signal_id, value, metadata)
+                        (asof_date, ticker, signal_name, company_uid, value, metadata)
                         VALUES (%s, %s, %s, %s, %s, %s)
                         ON CONFLICT (asof_date, ticker, signal_name) 
                         DO UPDATE SET
-                            signal_id = EXCLUDED.signal_id,
+                            company_uid = EXCLUDED.company_uid,
                             value = EXCLUDED.value,
                             metadata = EXCLUDED.metadata,
                             created_at = CURRENT_TIMESTAMP;
@@ -629,12 +1007,11 @@ def insert_signal(main_conn, ticker: str, target_date: date, signal_name: str, v
                         target_date,
                         ticker,
                         signal_name,
-                        signal_id,
+                        company_uid,  # Can be None
                         value,  # Can be None
                         metadata_json
                     ))
                 else:
-                    # Fallback: try without signal_id (might fail if NOT NULL)
                     cursor.execute("""
                         INSERT INTO signal_raw 
                         (asof_date, ticker, signal_name, value, metadata)
@@ -651,24 +1028,6 @@ def insert_signal(main_conn, ticker: str, target_date: date, signal_name: str, v
                         value,  # Can be None
                         metadata_json
                     ))
-            else:
-                # Use signal_name only (old schema)
-                cursor.execute("""
-                    INSERT INTO signal_raw 
-                    (asof_date, ticker, signal_name, value, metadata)
-                    VALUES (%s, %s, %s, %s, %s)
-                    ON CONFLICT (asof_date, ticker, signal_name) 
-                    DO UPDATE SET
-                        value = EXCLUDED.value,
-                        metadata = EXCLUDED.metadata,
-                        created_at = CURRENT_TIMESTAMP;
-                """, (
-                    target_date,
-                    ticker,
-                    signal_name,
-                    value,  # Can be None
-                    metadata_json
-                ))
             
             main_conn.commit()
             
@@ -711,133 +1070,174 @@ def ensure_value_column_nullable(main_conn):
 
 
 def process_date_range(start_date: date, end_date: date, ore_conn, main_conn, analyzer: FinBERTSentimentAnalyzer):
-    """Process sentiment calculation for all dates in the range."""
-    current_date = start_date
+    """
+    Process sentiment calculation for all dates in the range.
+    
+    Expected behavior:
+    1. Get all tickers with company_uid from varrock.tickers
+    2. For each date in range:
+       2.1 For each ticker:
+           2.1.1 Get news for that ticker for that day
+           2.1.2 Calculate sentiment using FinBERT
+           2.1.3 Insert/replace sentiment in copper.yfinance_news_sentiment
+    3. For each date in range:
+       3.1 For each ticker:
+           3.1.1 Get sentiment scores for last 28 days before current date
+           3.1.2 Aggregate with decay of 0.5 per day
+       3.2 Insert aggregated values in signal_raw with company_uid
+    """
+    # Step 1: Get all tickers with company_uid
+    logger.info("Step 1: Getting all tickers with company_uid from varrock.tickers...")
+    ticker_to_company_uid = get_all_tickers_with_company_uid(main_conn)
+    all_tickers = list(ticker_to_company_uid.keys())
+    logger.info(f"Found {len(all_tickers)} tickers to process")
+    
     total_sentiments_processed = 0
     total_signals_processed = 0
     total_errors = 0
     
+    # Step 2: Process sentiment for each date and ticker
+    logger.info(f"\n{'='*60}")
+    logger.info("Step 2: Processing sentiment for news articles")
+    logger.info(f"{'='*60}")
+    
+    current_date = start_date
     while current_date <= end_date:
-        logger.info(f"\n{'='*60}")
-        logger.info(f"Processing date: {current_date}")
-        logger.info(f"{'='*60}")
+        logger.info(f"\nProcessing sentiment for date: {current_date}")
         
-        try:
-            # Step 1: Get all news for this date
-            news_list = get_news_for_date(ore_conn, current_date)
-            
-            # Get all tickers from main database (needed for NULL signal insertion)
-            all_tickers = get_all_tickers(main_conn)
-            
-            if not news_list:
-                logger.info(f"No news found for {current_date}. Inserting NULL signals for all tickers.")
-                # Insert NULL signals for all tickers when no news
-                for ticker in all_tickers:
+        date_sentiments = 0
+        date_news_count = 0
+        
+        for ticker in all_tickers:
+            try:
+                # Step 2.1.1: Get all news for this ticker for this day
+                news_list = get_news_for_ticker_and_date(ore_conn, ticker, current_date)
+                
+                if not news_list:
+                    logger.debug(f"  {ticker}: No news for this date")
+                    continue  # No news for this ticker on this date
+                
+                logger.info(f"  {ticker}: Found {len(news_list)} news articles")
+                date_news_count += len(news_list)
+                
+                # Step 2.1.2 & 2.1.3: Calculate sentiment and insert/replace
+                for news in news_list:
                     try:
-                        # Check if signal already processed
-                        if is_signal_processed(main_conn, ticker, current_date, 'SENTIMENT_YFINANCE_NEWS'):
+                        news_id = news['id']
+                        
+                        # Combine title and summary for sentiment analysis
+                        text = f"{news['title']} {news['summary']}".strip()
+                        
+                        if not text:
+                            logger.warning(f"    Skipping news_id {news_id} - no text content")
                             continue
                         
-                        # Insert NULL signal
-                        insert_signal(
-                            main_conn,
-                            ticker,
-                            current_date,
-                            'SENTIMENT_YFINANCE_NEWS',
-                            None,  # NULL value
-                            {'reason': 'no_news_data_for_date', 'date': str(current_date)}
-                        )
-                        total_signals_processed += 1
+                        # Calculate sentiment using FinBERT
+                        logger.debug(f"    Calculating sentiment for {ticker} news_id {news_id}")
+                        sentiment_data = analyzer.analyze_sentiment(text)
+                        
+                        # Insert or replace sentiment (insert_sentiment handles ON CONFLICT DO UPDATE)
+                        insert_sentiment(ore_conn, news_id, ticker, sentiment_data)
+                        total_sentiments_processed += 1
+                        date_sentiments += 1
+                        
+                        logger.debug(f"    ✓ Processed sentiment for {ticker} news_id {news_id}: {sentiment_data['label']} ({sentiment_data['score']:.3f})")
+                        
                     except Exception as e:
                         total_errors += 1
-                        logger.error(f"ERROR: Failed to insert NULL signal for {ticker} on {current_date}: {e}", exc_info=True)
+                        logger.error(f"    ERROR: Failed to process sentiment for {ticker} news_id {news.get('id', 'unknown')}: {e}", exc_info=True)
                         continue
-                
-                current_date += timedelta(days=1)
+                        
+            except Exception as e:
+                total_errors += 1
+                logger.error(f"  ERROR: Failed to process news for {ticker} on {current_date}: {e}", exc_info=True)
                 continue
-            
-            # Step 2: Process sentiment for each news article
-            processed_tickers = set()
-            for news in news_list:
-                try:
-                    news_id = news['id']
-                    ticker = news['ticker']
-                    processed_tickers.add(ticker)
-                    
-                    # Check if already processed
-                    if is_sentiment_processed(ore_conn, news_id):
-                        logger.debug(f"Sentiment already processed for news_id {news_id}, skipping")
-                        continue
-                    
-                    # Combine title and summary for sentiment analysis
-                    text = f"{news['title']} {news['summary']}".strip()
-                    
-                    # Calculate sentiment
-                    logger.info(f"Calculating sentiment for {ticker} news_id {news_id}")
-                    sentiment_data = analyzer.analyze_sentiment(text)
-                    
-                    # Insert sentiment
-                    insert_sentiment(ore_conn, news_id, ticker, sentiment_data)
-                    total_sentiments_processed += 1
-                    
-                    logger.info(f"✓ Processed sentiment for {ticker} news_id {news_id}: {sentiment_data['label']} ({sentiment_data['score']:.3f})")
-                    
-                except Exception as e:
-                    total_errors += 1
-                    logger.error(f"ERROR: Failed to process sentiment for news_id {news.get('id', 'unknown')}: {e}", exc_info=True)
-                    continue
-            
-            # Step 3: Calculate aggregated sentiment signals for each ticker
-            for ticker in processed_tickers:
-                try:
-                    # Check if signal already processed
-                    if is_signal_processed(main_conn, ticker, current_date, 'SENTIMENT_YFINANCE_NEWS'):
-                        logger.info(f"Signal already processed for {ticker} on {current_date}, skipping")
-                        continue
-                    
-                    # Get sentiment for last 7 days
-                    sentiment_list = get_sentiment_for_date_range(ore_conn, ticker, current_date, days=7)
-                    
-                    if not sentiment_list:
-                        # No sentiment data available - insert NULL signal
-                        logger.info(f"No sentiment data available for {ticker} on {current_date}, inserting NULL signal")
-                        insert_signal(
-                            main_conn,
-                            ticker,
-                            current_date,
-                            'SENTIMENT_YFINANCE_NEWS',
-                            None,  # NULL value
-                            {'reason': 'no_sentiment_data_available', 'date': str(current_date)}
-                        )
-                        total_signals_processed += 1
-                        logger.info(f"✓ Inserted NULL signal for {ticker} on {current_date} (no sentiment data)")
-                    else:
-                        # Calculate aggregated sentiment
-                        aggregated = calculate_aggregated_sentiment(sentiment_list, current_date)
-                        
-                        # Insert signal
-                        insert_signal(
-                            main_conn,
-                            ticker,
-                            current_date,
-                            'SENTIMENT_YFINANCE_NEWS',
-                            aggregated['aggregated_score'],
-                            aggregated['metadata']
-                        )
-                        
-                        total_signals_processed += 1
-                        logger.info(f"✓ Processed aggregated sentiment signal for {ticker} on {current_date}: {aggregated['aggregated_score']:.3f} (from {aggregated['count']} news articles)")
-                    
-                except Exception as e:
-                    total_errors += 1
-                    logger.error(f"ERROR: Failed to process signal for {ticker} on {current_date}: {e}", exc_info=True)
-                    continue
         
-        except Exception as e:
-            total_errors += 1
-            logger.error(f"ERROR: Failed to process date {current_date}: {e}", exc_info=True)
+        logger.info(f"  Date {current_date} summary: {date_news_count} news articles, {date_sentiments} sentiments processed")
+        current_date += timedelta(days=1)
+    
+    # Step 3: Calculate aggregated signals for each date and ticker
+    logger.info(f"\n{'='*60}")
+    logger.info("Step 3: Calculating aggregated sentiment signals")
+    logger.info(f"{'='*60}")
+    
+    current_date = start_date
+    while current_date <= end_date:
+        logger.info(f"\nProcessing aggregated signals for date: {current_date}")
         
-        # Move to next date
+        # Track processed company_uid pairs to avoid duplicates
+        processed_company_uids = set()
+        
+        tickers_processed_count = 0
+        tickers_skipped_count = 0
+        tickers_null_count = 0
+        tickers_with_sentiment_count = 0
+        
+        for ticker in all_tickers:
+            try:
+                company_uid = ticker_to_company_uid.get(ticker)
+                
+                # Check if this company_uid/signal_name pair has already been processed
+                if company_uid and (company_uid, 'SENTIMENT_YFINANCE_NEWS') in processed_company_uids:
+                    logger.debug(f"  {ticker}: Signal already processed for company_uid {company_uid}, skipping")
+                    tickers_skipped_count += 1
+                    continue
+                
+                # Check if signal already processed in database
+                if is_signal_processed(main_conn, ticker, current_date, 'SENTIMENT_YFINANCE_NEWS', company_uid):
+                    logger.info(f"  {ticker}: Signal already processed in database, skipping (use --force to reprocess)")
+                    tickers_skipped_count += 1
+                    continue
+                
+                # Step 3.1.1: Get sentiment scores for last 28 days up to and including current date
+                sentiment_list = get_sentiment_for_date_range(ore_conn, ticker, current_date, days=28)
+                
+                if not sentiment_list:
+                    # No sentiment data available - insert NULL signal
+                    logger.info(f"  {ticker}: No sentiment data available, inserting NULL signal")
+                    tickers_null_count += 1
+                    insert_signal(
+                        main_conn,
+                        ticker,
+                        current_date,
+                        'SENTIMENT_YFINANCE_NEWS',
+                        None,  # NULL value
+                        {'reason': 'no_sentiment_data_available', 'date': str(current_date)}
+                    )
+                    
+                    # Mark this company_uid/signal_name pair as processed
+                    if company_uid:
+                        processed_company_uids.add((company_uid, 'SENTIMENT_YFINANCE_NEWS'))
+                    
+                    total_signals_processed += 1
+                else:
+                    # Step 3.1.2: Aggregate sentiment with decay of 0.5 per day
+                    aggregated = calculate_aggregated_sentiment(sentiment_list, current_date, window_days=28)
+                    
+                    # Step 3.2: Insert aggregated value in signal_raw with company_uid
+                    insert_signal(
+                        main_conn,
+                        ticker,
+                        current_date,
+                        'SENTIMENT_YFINANCE_NEWS',
+                        aggregated['aggregated_score'],
+                        aggregated['metadata']
+                    )
+                    
+                    # Mark this company_uid/signal_name pair as processed
+                    if company_uid:
+                        processed_company_uids.add((company_uid, 'SENTIMENT_YFINANCE_NEWS'))
+                    
+                    total_signals_processed += 1
+                    tickers_with_sentiment_count += 1
+                    logger.info(f"  {ticker}: Aggregated score = {aggregated['aggregated_score']:.3f} (from {aggregated['count']} news articles)")
+                    
+            except Exception as e:
+                total_errors += 1
+                logger.error(f"  ERROR: Failed to process signal for {ticker} on {current_date}: {e}", exc_info=True)
+                continue
+        
+        logger.info(f"  Processed {tickers_with_sentiment_count} tickers with sentiment, {tickers_null_count} with NULL signals, {tickers_skipped_count} skipped")
         current_date += timedelta(days=1)
     
     # Summary
@@ -867,10 +1267,10 @@ def get_date_range_from_env() -> Tuple[date, date]:
             logger.error("Expected format: YYYY-MM-DD")
             raise
     else:
-        # Default to today if not specified
-        today = date.today()
-        logger.info(f"No date range specified, using today: {today}")
-        return today, today
+        # Default to yesterday if not specified (more likely to have news)
+        yesterday = date.today() - timedelta(days=1)
+        logger.info(f"No date range specified, using yesterday: {yesterday} (today may not have news yet)")
+        return yesterday, yesterday
 
 
 def main():
